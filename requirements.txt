@@ -1,2 +1,4 @@
 boto==2.48.0
 boto3==1.5.9
+requests==2.18.4
+envoy==0.0.3
