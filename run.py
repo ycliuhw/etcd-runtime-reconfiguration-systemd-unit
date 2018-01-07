@@ -4,8 +4,8 @@ import os
 import logging
 
 import boto3
-from requests import get, post
-import envoy
+from requests import get, post, delete
+# import envoy
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
@@ -17,6 +17,12 @@ META_DATA_FILE_NAME = '/run/metadata/etcd'
 asg_client = boto3.client('autoscaling')
 ec2_client = boto3.client('ec2')
 elb_client = boto3.client('elb')
+
+
+class ClusterCrashError(Exception):
+    """cluster is totally broken and quorum cannot be restored, it needs to rebuild and retore data manually
+    """
+    pass
 
 
 class EtcdCluster(object):
@@ -58,7 +64,7 @@ class EtcdCluster(object):
         self()
 
     def _prepare_metadata(self):
-        members = get(self.etcd_api_uri).json()['members']
+        members = self.list_member()
         self.data[VAR_PREFIX + 'INITIAL_CLUSTER'] = ','.join(
             [
                 '{id}={dns}'.format(id=member['id'], dns=member['peerURLs'][0])
@@ -92,6 +98,42 @@ class EtcdCluster(object):
         logger.info('add_member payload -> %s', payload)
         r = post(self.etcd_api_uri, json=payload)
         logger.info('add_member %s -> \n%s', ip, r.json())
+
+    def _cleanup_bad_member(self):
+        healthy_members = []
+        unhealthy_members = []
+        for member in self.list_member():
+            if self.is_member_healthy(member):
+                healthy_members.append(member)
+            else:
+                unhealthy_members.append(member)
+
+        if len(healthy_members) < 2:
+            raise ClusterCrashError('healthy member is less than 2!!!')
+
+        for member in unhealthy_members:
+            logger.warn('Unhealthy member found ->%s, removing it now!', member)
+            self.remove_member(id=member['id'])
+
+    def is_member_healthy(member):
+        try:
+            client_url = member['clientURLs'][0]
+        except KeyError:
+            logger.error('No `clientURLs` for member -> %s', member)
+            return False
+
+        try:
+            return get(client_url + '/health').json()['health'] == 'true'
+        except Exception as e:
+            logger.error('`is_member_healthy` check failed, error -> %s, member -> %s', e, member)
+            return False
+
+    def list_member(self):
+        return get(self.etcd_api_uri).json()['members']
+
+    def remove_member(self, id):
+        r = delete(self.etcd_api_uri + '/%s' % id)
+        logger.info('remove_member %s -> \n%s', id, r.json())
 
     @property
     def local_ipv4(self):
