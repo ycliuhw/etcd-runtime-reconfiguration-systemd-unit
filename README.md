@@ -14,13 +14,15 @@ ETCD_RECONFIG_INITIAL_CLUSTER_STATE=existing/
 ```
 [Unit]
 Description=ETCD metdata agent
+Requires=metadata.service
 Requires=docker.service
+After=metadata.service
 After=docker.service
 
 [Service]
 Type=oneshot
 EnvironmentFile=/run/metadata/ec2
-ExecStartPre=-/usr/bin/docker stop ec2-metdata
+ExecStartPre=-/usr/bin/docker stop etcd-runtime-reconfiguration-systemd-unit
 ExecStartPre=-/usr/bin/docker rm -f etcd-runtime-reconfiguration-systemd-unit
 ExecStartPre=/usr/bin/docker pull ycliuhw/etcd-runtime-reconfiguration-systemd-unit
 ExecStart=/usr/bin/docker run --name=etcd-runtime-reconfiguration-systemd-unit -v /run/metadata:/run/metadata -e ASG_NAME=${AWS_TAG_ASG_GROUPNAME} -e AWS_DEFAULT_REGION=${AWS_REGION} -v $(which etcdctl):/etcdctl ycliuhw/etcd-runtime-reconfiguration-systemd-unit:latest
