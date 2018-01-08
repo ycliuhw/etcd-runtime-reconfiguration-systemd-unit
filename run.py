@@ -15,7 +15,7 @@ ETCDCTL_PATH = '/etcdctl'
 META_DATA_FILE_NAME = '/run/metadata/etcd'
 
 asg_client = boto3.client('autoscaling')
-ec2_client = boto3.client('ec2')
+# ec2_client = boto3.client('ec2')
 elb_client = boto3.client('elb')
 
 
