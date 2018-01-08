@@ -38,7 +38,8 @@ class EtcdCluster(object):
     etcd_api_uri = None
     cached_props = None
 
-    def __init__(self, asg_name):
+    def __init__(self, asg_name, discovery_url):
+        self.discovery_url = discovery_url
         self.cached_props = self.cached_props or {}
 
         asg_meta = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups'][0]
@@ -134,7 +135,8 @@ class EtcdCluster(object):
         healthy_members = [m for m in members if m['is_healthy'] is True]
         if len(members) >= 2 and len(healthy_members) < 2:
             raise ClusterCrashError('Quorum lost: healthy members are less than 2!!!')
-        if len(healthy_members) >= 2:
+        current_nodes = get(self.discovery_url).json()['node'].get('nodes', [])
+        if len(current_nodes) >= 2:
             state = ClusterState.EXISTING
         return state
 
@@ -170,11 +172,12 @@ class EtcdCluster(object):
 if __name__ == '__main__':
 
     asg_name = os.environ.get('ASG_NAME', None)
+    discovery_url = os.environ.get('DISCOVERY_URL', None)
 
     # ensure `ASG_NAME` specified
-    if asg_name is None:
+    if asg_name is None or discovery_url is None:
         raise Exception('`ASG_NAME` is required in env')
     # ensure `etcdctl` is accessible
     if not os.path.isfile(ETCDCTL_PATH) or not os.access(ETCDCTL_PATH, os.X_OK):
         raise Exception('%s is not executable!!!' % ETCDCTL_PATH)
-    EtcdCluster(asg_name)
+    EtcdCluster(asg_name=asg_name, discovery_url=discovery_url)
