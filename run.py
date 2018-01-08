@@ -2,12 +2,13 @@
 
 import os
 import logging
+from enum import Enum
 
 import boto3
 from requests import get, post, delete
 # import envoy
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 VAR_PREFIX = 'ETCD_RECONFIG_'
@@ -17,6 +18,11 @@ META_DATA_FILE_NAME = '/run/metadata/etcd'
 asg_client = boto3.client('autoscaling')
 # ec2_client = boto3.client('ec2')
 elb_client = boto3.client('elb')
+
+
+class ClusterState(Enum):
+    NEW = 'new'
+    EXISTING = 'existing'
 
 
 class ClusterCrashError(Exception):
@@ -87,6 +93,9 @@ class EtcdCluster(object):
         return dns.rstrip('/')
 
     def add_member(self, ip=None):
+        # do cleanup before add member
+        self._cleanup_bad_member()
+
         ip = ip or self.local_ipv4
         # cmd = self.etcdctl_cmd + ' member add {name} http://{ip}:2380'.format(name=ip, ip=ip)
         # logger.info('add_member cmd -> %s', cmd)
@@ -97,30 +106,21 @@ class EtcdCluster(object):
         payload = dict(peerURLs=["http://%s:2380" % ip], name=ip)
         logger.info('add_member payload -> %s', payload)
         r = post(self.etcd_api_uri, json=payload)
-        logger.info('add_member %s -> \n%s', ip, r.json())
+        logger.info('add_member %s -> \n%s, %s', ip, r.status_code, r.json())
 
     def _cleanup_bad_member(self):
-        healthy_members = []
-        unhealthy_members = []
-        for member in self.list_member():
-            if self.is_member_healthy(member):
-                healthy_members.append(member)
-            else:
-                unhealthy_members.append(member)
-
-        if len(healthy_members) < 2:
-            raise ClusterCrashError('healthy member is less than 2!!!')
-
+        unhealthy_members = [m for m in self.list_member() if m['is_healthy'] is False]
         for member in unhealthy_members:
             logger.warn('Unhealthy member found ->%s, removing it now!', member)
             self.remove_member(id=member['id'])
 
-    def is_member_healthy(member):
+    def is_member_healthy(self, member):
         try:
             client_url = member['clientURLs'][0]
-        except KeyError:
-            logger.error('No `clientURLs` for member -> %s', member)
-            return False
+        except (KeyError, IndexError):
+            # new member needs to be ignored (neither healthy nor unhealthy)
+            logger.warn('No `clientURLs` for member(it is probably a newly added member) -> %s', member)
+            return None
 
         try:
             return get(client_url + '/health').json()['health'] == 'true'
@@ -128,8 +128,21 @@ class EtcdCluster(object):
             logger.error('`is_member_healthy` check failed, error -> %s, member -> %s', e, member)
             return False
 
+    def get_cluster_state(self):
+        state = ClusterState.NEW
+        members = self.list_member()
+        healthy_members = [m for m in members if m['is_healthy'] is True]
+        if len(members) >= 2 and len(healthy_members) < 2:
+            raise ClusterCrashError('Quorum lost: healthy members are less than 2!!!')
+        if len(healthy_members) >= 2:
+            state = ClusterState.EXISTING
+        return state
+
     def list_member(self):
-        return get(self.etcd_api_uri).json()['members']
+        members = get(self.etcd_api_uri).json()['members']
+        for member in members:
+            member['is_healthy'] = self.is_member_healthy(member)
+        return members
 
     def remove_member(self, id):
         r = delete(self.etcd_api_uri + '/%s' % id)
@@ -142,8 +155,16 @@ class EtcdCluster(object):
         return self.cached_props['local_ipv4']
 
     def __call__(self):
-        self.add_member()
-        self.ensure_metadata()
+        state = self.get_cluster_state()
+        if state == ClusterState.EXISTING:
+            # this is ONLY for existing cluster - `runtime reconfiguration`
+            logger.info(
+                '%s cluster, so doing 1. `add_member`, 2. `ensure_metadata` for reconfiguration later...', state
+            )
+            self.add_member()
+            self.ensure_metadata()
+        else:
+            logger.info('%s cluster, nothing to do with it, ignoring...', state)
 
 
 if __name__ == '__main__':
