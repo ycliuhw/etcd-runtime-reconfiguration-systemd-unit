@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 VAR_PREFIX = 'ETCD_RECONFIG_'
-ETCDCTL_PATH = '/etcdctl'
+ETCDCTL_PATH = '/usr/bin/etcdctl'
 META_DATA_FILE_NAME = '/run/metadata/etcd'
 
 asg_client = boto3.client('autoscaling')
@@ -39,7 +39,7 @@ class EtcdCluster(object):
     cached_props = None
 
     def __init__(self, asg_name, discovery_url):
-        self.discovery_url = discovery_url
+        self.state = self.get_cluster_state(discovery_url=discovery_url)
         self.cached_props = self.cached_props or {}
 
         asg_meta = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups'][0]
@@ -129,13 +129,9 @@ class EtcdCluster(object):
             logger.error('`is_member_healthy` check failed, error -> %s, member -> %s', e, member)
             return False
 
-    def get_cluster_state(self):
+    def get_cluster_state(self, discovery_url):
         state = ClusterState.NEW
-        members = self.list_member()
-        healthy_members = [m for m in members if m['is_healthy'] is True]
-        if len(members) >= 2 and len(healthy_members) < 2:
-            raise ClusterCrashError('Quorum lost: healthy members are less than 2!!!')
-        current_nodes = get(self.discovery_url).json()['node'].get('nodes', [])
+        current_nodes = get(discovery_url).json()['node'].get('nodes', [])
         if len(current_nodes) >= 2:
             state = ClusterState.EXISTING
         return state
@@ -144,6 +140,10 @@ class EtcdCluster(object):
         members = get(self.etcd_api_uri).json()['members']
         for member in members:
             member['is_healthy'] = self.is_member_healthy(member)
+
+        healthy_members = [m for m in members if m['is_healthy'] is True]
+        if len(members) >= 2 and len(healthy_members) < 2:
+            raise ClusterCrashError('Quorum lost: healthy members are less than 2!!!')
         return members
 
     def remove_member(self, id):
@@ -157,16 +157,15 @@ class EtcdCluster(object):
         return self.cached_props['local_ipv4']
 
     def __call__(self):
-        state = self.get_cluster_state()
-        if state == ClusterState.EXISTING:
+        if self.state == ClusterState.EXISTING:
             # this is ONLY for existing cluster - `runtime reconfiguration`
             logger.info(
-                '%s cluster, so doing 1. `add_member`, 2. `ensure_metadata` for reconfiguration later...', state
+                '%s cluster, so doing 1. `add_member`, 2. `ensure_metadata` for reconfiguration later...', self.state
             )
             self.add_member()
             self.ensure_metadata()
         else:
-            logger.info('%s cluster, nothing to do with it, ignoring...', state)
+            logger.info('%s cluster, nothing to do with it, ignoring...', self.state)
 
 
 if __name__ == '__main__':
