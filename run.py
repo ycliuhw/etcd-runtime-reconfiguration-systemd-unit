@@ -74,15 +74,15 @@ class EtcdCluster(object):
     def _prepare_metadata(self, state):
         if state == ClusterState.NEW:
             ENV_CLUSTER = {
-                'ETCD_ADVERTISE_CLIENT_URLS': 'http://{PRIVATE_IPV4}:2379',
-                'ETCD_INITIAL_ADVERTISE_PEER_URLS': 'http://{PRIVATE_IPV4}:2380',
+                'ETCD_ADVERTISE_CLIENT_URLS': 'http://%s:2379' % self.local_ipv4,
+                'ETCD_INITIAL_ADVERTISE_PEER_URLS': 'http://%s:2380' % self.local_ipv4,
                 'ETCD_LISTEN_CLIENT_URLS': 'http://0.0.0.0:2379,http://0.0.0.0:4001',
-                'ETCD_LISTEN_PEER_URLS': 'http://{PRIVATE_IPV4}:2380',
+                'ETCD_LISTEN_PEER_URLS': 'http://%s:2380' % self.local_ipv4,
                 'ETCD_DISCOVERY': None,
             }
 
             ENV_CLUSTER = {
-                os.environ.get(k, None) if v is None else v
+                k: os.environ.get(k, None) if v is None else v
                 for k, v in ENV_CLUSTER.items()
             }
         else:
@@ -97,6 +97,7 @@ class EtcdCluster(object):
                 ),
                 'ETCD_INITIAL_CLUSTER_STATE': ClusterState.EXISTING,
             }
+        logger.info('ENV_CLUSTER -> \n%s', ENV_CLUSTER)
         self.data.update(ENV_CLUSTER)
 
     def validate_metadata(self, data):
@@ -194,7 +195,7 @@ class EtcdCluster(object):
             )
             self.add_member()
         else:
-            logger.info('%s cluster, nothing to do with it, ignoring...', state)
+            logger.info('%s cluster, ', state)
 
         self.ensure_metadata(state=state)
 
