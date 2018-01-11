@@ -3,6 +3,7 @@
 import os
 import logging
 from enum import Enum
+from uuid import uuid4
 
 import boto3
 from requests import get, post, delete
@@ -11,18 +12,19 @@ from requests import get, post, delete
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-VAR_PREFIX = 'ETCD_RECONFIG_'
+
+class ClusterState(Enum):
+    NEW = 'new'
+    EXISTING = 'existing'
+
+
+VAR_PREFIX = 'K_ETCD_'
 ETCDCTL_PATH = '/usr/bin/etcdctl'
 META_DATA_FILE_NAME = '/run/metadata/etcd'
 
 asg_client = boto3.client('autoscaling')
 # ec2_client = boto3.client('ec2')
 elb_client = boto3.client('elb')
-
-
-class ClusterState(Enum):
-    NEW = 'new'
-    EXISTING = 'existing'
 
 
 class ClusterCrashError(Exception):
@@ -38,8 +40,7 @@ class EtcdCluster(object):
     etcd_api_uri = None
     cached_props = None
 
-    def __init__(self, asg_name, discovery_url):
-        self.state = self.get_cluster_state(discovery_url=discovery_url)
+    def __init__(self, asg_name):
         self.cached_props = self.cached_props or {}
 
         asg_meta = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])['AutoScalingGroups'][0]
@@ -70,20 +71,44 @@ class EtcdCluster(object):
         logger.info('data -> \n%s', self.data)
         self()
 
-    def _prepare_metadata(self):
-        members = self.list_member()
-        self.data[VAR_PREFIX + 'INITIAL_CLUSTER'] = ','.join(
-            [
-                '{id}={dns}'.format(id=member['id'], dns=member['peerURLs'][0])
-                for member in members
-            ]
-        )
-        self.data[VAR_PREFIX + 'INITIAL_CLUSTER_STATE'] = 'existing'
+    def _prepare_metadata(self, state):
+        if state == ClusterState.NEW:
+            ENV_CLUSTER = {
+                'ETCD_ADVERTISE_CLIENT_URLS': 'http://{PRIVATE_IPV4}:2379',
+                'ETCD_INITIAL_ADVERTISE_PEER_URLS': 'http://{PRIVATE_IPV4}:2380',
+                'ETCD_LISTEN_CLIENT_URLS': 'http://0.0.0.0:2379,http://0.0.0.0:4001',
+                'ETCD_LISTEN_PEER_URLS': 'http://{PRIVATE_IPV4}:2380',
+                'ETCD_DISCOVERY': None,
+            }
 
-    def ensure_metadata(self):
-        self._prepare_metadata()
-        metadata = '\n'.join(['{k}={v}'.format(k=k, v=v) for k, v in self.data.items()])
-        logger.info('writing metadata to `%s` -> \n%s', META_DATA_FILE_NAME, metadata)
+            ENV_CLUSTER = {
+                os.environ.get(k, None) if v is None else v
+                for k, v in ENV_CLUSTER.items()
+            }
+        else:
+            members = self.list_member()
+            ENV_CLUSTER = {
+                'ETCD_NAME': uuid4(),
+                'ETCD_INITIAL_CLUSTER': ','.join(
+                    [
+                        '{id}={dns}'.format(id=member['id'], dns=member['peerURLs'][0])
+                        for member in members
+                    ]
+                ),
+                'ETCD_INITIAL_CLUSTER_STATE': ClusterState.EXISTING,
+            }
+        self.data.update(ENV_CLUSTER)
+
+    def validate_metadata(self, data):
+        for k, v in data.items():
+            if not v:
+                raise ValueError('validate_metadata, `%s=%s` was missing!', k, v)
+        return data
+
+    def ensure_metadata(self, state):
+        self._prepare_metadata(state)
+        metadata = '\n'.join(['{k}={v}'.format(k=k, v=v) for k, v in self.validate_metadata(self.data).items()])
+        logger.info('writing metadata (state -> `%s`) to `%s` -> \n%s', state, META_DATA_FILE_NAME, metadata)
         with open(META_DATA_FILE_NAME, 'w') as f:
             f.write(metadata)
 
@@ -129,11 +154,15 @@ class EtcdCluster(object):
             logger.error('`is_member_healthy` check failed, error -> %s, member -> %s', e, member)
             return False
 
-    def get_cluster_state(self, discovery_url):
-        state = ClusterState.NEW
-        current_nodes = get(discovery_url).json()['node'].get('nodes', [])
-        if len(current_nodes) >= 2:
+    def get_cluster_state(self):
+
+        try:
+            current_members = self.list_member()
             state = ClusterState.EXISTING
+            logger.info('get_cluster_state: cluster state -> %s, current_members -> %s', state, current_members)
+        except IOError as e:
+            state = ClusterState.NEW
+            logger.warn('get_cluster_state: error -> %s, so state -> %s', e, state)
         return state
 
     def list_member(self):
@@ -157,26 +186,28 @@ class EtcdCluster(object):
         return self.cached_props['local_ipv4']
 
     def __call__(self):
-        if self.state == ClusterState.EXISTING:
+        state = self.get_cluster_state()
+        if state == ClusterState.EXISTING:
             # this is ONLY for existing cluster - `runtime reconfiguration`
             logger.info(
-                '%s cluster, so doing 1. `add_member`, 2. `ensure_metadata` for reconfiguration later...', self.state
+                '%s cluster, so doing 1. `add_member`, 2. `ensure_metadata` for reconfiguration later...', state
             )
             self.add_member()
-            self.ensure_metadata()
         else:
-            logger.info('%s cluster, nothing to do with it, ignoring...', self.state)
+            logger.info('%s cluster, nothing to do with it, ignoring...', state)
+
+        self.ensure_metadata(state=state)
 
 
 if __name__ == '__main__':
 
     asg_name = os.environ.get('ASG_NAME', None)
-    discovery_url = os.environ.get('DISCOVERY_URL', None)
+    discovery_url = os.environ.get('ETCD_DISCOVERY', None)
 
     # ensure `ASG_NAME` specified
     if asg_name is None or discovery_url is None:
-        raise Exception('`ASG_NAME` is required in env')
+        raise Exception('`ASG_NAME` `ETCD_DISCOVERY` are required in env')
     # ensure `etcdctl` is accessible
     if not os.path.isfile(ETCDCTL_PATH) or not os.access(ETCDCTL_PATH, os.X_OK):
         raise Exception('%s is not executable!!!' % ETCDCTL_PATH)
-    EtcdCluster(asg_name=asg_name, discovery_url=discovery_url)
+    EtcdCluster(asg_name=asg_name)
